@@ -1,0 +1,396 @@
+def train_frequency(self, data, sampling_rate=500):
+        """
+        Only frequency entrainment(decomposition) happens here. 
+        No amplitude learning happens here (alpha - maybe use sum of 
+        squares error to learn amplitudes of individual frequency component).
+        
+        Parameters:
+        NEPOCHS: How long to run the model
+
+        TODO: Later add Iext as well
+
+        Return:
+        W: Change in W
+        PHI: Change in pahse
+        N_PHI_DIFF: Normalized pahse difference
+
+        Miscellaneous:
+            1. Normalized pahse difference approaches zero ss individual oscillators attain equillibrium 
+            2. No dynamics for Amplitude of lateral coupling i.e. dA = 0
+        """
+        self.sampling_rate = sampling_rate
+        #self.DT = 1.0/self.sampling_rate
+        self.DT = 0.001#0.001
+        data = self.Preprocess(data)
+        self.NSAMPLES = len(data)
+        
+        self.progress = 0
+        
+        # Be careful while changing these assignment!! Check out TIP section
+        self.OMEGA_ = np.zeros([self.N, self.NEPOCHS+1])
+        self.SIG_ = np.zeros([self.NEPOCHS, self.NSAMPLES])
+        self.THETA_ = np.zeros([self.N, self.N, self.NEPOCHS+1])
+        self.NORM_PHASE_DIFF_ = np.zeros([self.N, self.N, self.NEPOCHS])
+        self.OMEGA_VERBOSE_ = np.zeros([self.NEPOCHS, self.NSAMPLES, self.N])
+        
+        self.OMEGA_[:,0] = self.OMEGA.T
+        self.THETA_[:,:,0] = self.THETA
+        
+        for t in range(self.NEPOCHS):
+            # Why are they initializing R and THETA in every epoch?
+            #self.R = 1*np.ones([self.N, 1]) 
+            #self.PHI = 2*pi*np.random.rand(self.N, 1)
+            
+            PTEACH = np.zeros(self.NSAMPLES)
+            PTEACH = data
+            
+            for S in range(self.NSAMPLES):
+                
+                self.progress = 100*((t+1)*(S+1))/(self.NEPOCHS*self.NSAMPLES)
+
+                """
+                    1. Vector form - do simultaneous update 
+                    2. Below system handles complex sinusiodal input
+                    3. In all matrix rows contain source oscillator, and 
+                       columns represent coupling to corresponding target oscillator
+
+                    Caution:
+                    Use coloumn vector for each oscillator to avoid confusion
+                """
+
+                NORM_FREQ = np.multiply(self.OMEGA, 1/self.OMEGA.T) 
+                NORM_FREQ[np.isnan(NORM_FREQ)] = 0
+                
+                #Nij = ∅j/ωj - ∅i/ωi + θij/ωiωj
+                NORM_PHASE = (self.PHI/self.OMEGA).T - (self.PHI/self.OMEGA) + self.THETA/(self.OMEGA*self.OMEGA.T) 
+                
+                #To be used for training lateral weights Nij 
+                # ∅i/ωi - ∅j/ωj - θij/ωiωj
+                PHASE_DIFF = (self.PHI/self.OMEGA) - (self.PHI/self.OMEGA).T - self.THETA/(self.OMEGA*self.OMEGA.T) 
+                
+                """
+                    Causes of NaN
+                    1. Negative entries in R matrix. Any negative entry in R results in NaN i.e. complex value
+                    Replacing with 'self.R.T' to avoid numerical issues
+                """
+                R_POW_NF = self.R.T #np.power(self.R.T, NORM_FREQ) #self.R.T
+                
+                ARG = self.OMEGA*NORM_PHASE
+                ARG_2 = self.OMEGA*PHASE_DIFF
+                R_COUPLED = self.J*R_POW_NF*np.cos(ARG)
+                PHI_COUPLED = self.J*(R_POW_NF/self.R)*np.sin(ARG)
+                R_COUPLED = np.sum(R_COUPLED, axis=1) 
+                PHI_COUPLED = np.sum(PHI_COUPLED, axis=1)
+                #Converting to coloumn vector
+                R_COUPLED = R_COUPLED[:,None]
+                PHI_COUPLED = PHI_COUPLED[:,None]
+                
+                """
+                Equation valid only for real-valued signal
+                """
+                Z_CMPLX = self.R*np.exp(1j*self.PHI)
+                
+                #Delete me: For debugging
+                self.Z_CMPLX = Z_CMPLX
+                
+                Term1 = Z_CMPLX*(ONN.MU + 1j*self.OMEGA - np.absolute(Z_CMPLX)**2)
+                Term2 = np.sum(self.J*np.exp(1j*( self.THETA/self.OMEGA.T ))*np.power(Z_CMPLX.T, self.OMEGA/self.OMEGA.T), axis=1)[:,None]
+                Term3 = ONN.EPS*PTEACH[S]
+                
+                dZ_CMPLX = (Term1 + Term2 + Term3)*self.DT
+                Z_CMPLX = Z_CMPLX + dZ_CMPLX
+                
+                dOMEGA = -ONN.ETA_OMEGA*PTEACH[S]*np.sin(self.PHI)*self.DT
+                
+                #Equation2
+                COMPLEX_W = self.J*np.exp(1j*self.THETA/self.OMEGA.T)
+                Z1 = self.R*np.exp(1j*self.PHI) #Zi
+                Z2 = self.R.T*np.exp(-1j*self.PHI.T) #Zj*
+                Z2_SP = np.power(Z2, self.OMEGA/self.OMEGA.T)
+                
+                dCOMPLEX_W = (-COMPLEX_W + Z1*Z2_SP)
+                dCOMPLEX_W = np.around(dCOMPLEX_W, decimals=2) #TODO: delete this and add DS wrapper
+                
+                #For debugging: Delete me later
+                self.Z1 = Z1
+                self.Z2_SP = Z2_SP
+                self.dCOMPLEX_W = dCOMPLEX_W 
+                
+                COMPLEX_W = COMPLEX_W + dCOMPLEX_W/ONN.TAU
+                
+                self.R = np.absolute(Z_CMPLX)
+                self.PHI = np.angle(Z_CMPLX)
+                self.OMEGA = self.OMEGA + dOMEGA
+                self.THETA = np.angle(COMPLEX_W)*self.OMEGA.T
+                
+                """
+                    Corrections:
+                    1. Non-negative oscillator frequencies
+                    2. Entries in R mtrix should not be negative
+                """
+                #Restrict frequencies of oscillator to positive range only
+                self.OMEGA[self.OMEGA < 0.01] = 0.01 
+                #This avoids NaN restricting R to non-negative values
+                self.R[self.R < 0.01] = 0.01
+                #This avoids NaN due to 'A' term in the denominator in dTHETA
+                np.fill_diagonal(self.THETA, 0)
+                np.fill_diagonal(self.J, 0)
+                #Restrict theta (resulting from 1e-300 value of theta 
+                #returned by function np.angle) to avoid underflow error
+                #Might need tro handle the negative case as well
+                #self.THETA[self.THETA < 1e-200] = 1e-20
+                self.THETA = np.around(self.THETA, decimals=2)
+                
+                self.OMEGA_VERBOSE_[t, S, :] = self.OMEGA.T
+                #Value corresponding to last sample is important
+                #Wrong place for assignment, Change later.
+                self.NORM_PHASE_DIFF_[:,:,t] = NORM_PHASE
+            
+            #Chill! Does not increase time complexity (O(N^2)).
+            #New Training scheme
+            Reconstructed = self.generate_samples(self.NSAMPLES, self.DT, self.R, self.PHI, 
+                            self.OMEGA, self.J, self.THETA, self.ALPHA)    
+        
+            self.OMEGA_[:,t+1] = self.OMEGA.T
+            self.SIG_[t] = Reconstructed.flatten()
+            self.THETA_[:,:,t+1] = self.THETA
+            self.R_[:,t] = self.R.T
+            self.PHI_[:,t] = self.PHI.T
+            
+            print("End of epoch {}". format(t))
+     
+    @deprecated
+    def fit_eeg(self, data, sampling_rate=500):
+        """
+        Parameters:
+        NEPOCHS: How long to run the model
+
+        TODO: Later add Iext as well
+
+        Return:
+        W: Change in W
+        PHI: Change in pahse
+        N_PHI_DIFF: Normalized pahse difference
+
+        Miscellaneous:
+            1. Normalized pahse difference approaches zero ss individual oscillators attain equillibrium 
+            2. No dynamics for Amplitude of lateral coupling i.e. dA = 0
+        """
+        self.sampling_rate = sampling_rate
+        #self.DT = 1.0/self.sampling_rate
+        self.DT = 0.001#0.001
+        data = self.Preprocess(data)
+        self.NSAMPLES = len(data)
+        
+        self.progress = 0
+        
+        # Be careful while changing these assignment!! Check out TIP section
+        self.OMEGA_ = np.zeros([self.N, self.NEPOCHS+1])
+        self.SIG_ = np.zeros([self.NEPOCHS, self.NSAMPLES])
+        self.ERR_SIG_ = np.zeros([self.NEPOCHS, self.NSAMPLES])
+        self.ERR_ = np.zeros(self.NEPOCHS)
+        self.ALPHA_ = np.zeros([self.N, self.NEPOCHS+1])
+        self.THETA_ = np.zeros([self.N, self.N, self.NEPOCHS+1])
+        self.NORM_PHASE_DIFF_ = np.zeros([self.N, self.N, self.NEPOCHS])
+        self.OMEGA_VERBOSE_ = np.zeros([self.NEPOCHS, self.NSAMPLES, self.N])
+        self.R_VERBOSE_ = np.zeros([self.NEPOCHS, self.NSAMPLES, self.N])
+        self.PHI_VERBOSE_ = np.zeros([self.NEPOCHS, self.NSAMPLES, self.N])
+        self.THETA_VERBOSE_ = np.zeros([self.NEPOCHS, self.NSAMPLES, self.N, self.N])
+        
+        #Capturing the discrepancy in R due to coupling
+        R_CPL = np.zeros([self.N, 1])
+        PHI_CPL = np.zeros([self.N, 1])
+        self.R_CPL_ = np.zeros([self.N, self.NEPOCHS])
+        self.PHI_CPL_ = np.zeros([self.N, self.NEPOCHS])
+        self.dR_ = np.zeros([self.N, self.NEPOCHS])
+        self.dPHI_ = np.zeros([self.N, self.NEPOCHS])
+        self.dOMEGA_ = np.zeros([self.N, self.NEPOCHS])
+        self.dALPHA_ = np.zeros([self.N, self.NEPOCHS])
+        self.dW_ = np.zeros([self.N, self.N, self.NEPOCHS])
+        self.dW_VERBOSE_ = np.zeros([self.NEPOCHS, self.NSAMPLES, self.N, self.N])
+        
+        self.OMEGA_[:,0] = self.OMEGA.T
+        self.ALPHA_[:,0] = self.ALPHA.T
+        self.THETA_[:,:,0] = self.THETA
+        
+        Reconstructed = np.zeros(self.NSAMPLES) 
+        ERR = np.zeros(self.NSAMPLES)
+        PTEACH = np.zeros(self.NSAMPLES)
+        
+        #This increases time complexity (O(NSAMPLES*NEPOCHS)). This should be acceptable!
+        #Or use external signal directly to do the training.
+        #Reconstructed = self.generate_samples(self.NSAMPLES, self.DT, self.R, self.PHI, 
+        #                    self.OMEGA, self.J, self.THETA, self.ALPHA)    
+        #PTEACH = data
+        #ERR = PTEACH - Reconstructed
+        
+        for t in range(self.NEPOCHS):
+            # Why are they initializing R and THETA in every epoch?
+            #self.R = 1*np.ones([self.N, 1]) 
+            #self.PHI = 2*pi*np.random.rand(self.N, 1)
+            
+            for S in range(self.NSAMPLES):
+                
+                PTEACH[S] = data[S]
+                Reconstructed[S] = np.sum(self.ALPHA*np.cos(self.PHI))
+                ERR[S] = PTEACH[S] - Reconstructed[S]
+                
+                self.progress = 100*((t+1)*(S+1))/(self.NEPOCHS*self.NSAMPLES)
+
+                """
+                    1. Vector form - do simultaneous update 
+                    2. Below system handles complex sinusiodal input
+                    3. In all matrix rows contain source oscillator, and 
+                       columns represent coupling to corresponding target oscillator
+
+                    Caution:
+                    Use coloumn vector for each oscillator to avoid confusion
+                """
+
+                NORM_FREQ = np.multiply(self.OMEGA, 1/self.OMEGA.T) 
+                NORM_FREQ[np.isnan(NORM_FREQ)] = 0
+                
+                #Nij = ∅j/ωj - ∅i/ωi + θij/ωiωj
+                NORM_PHASE = (self.PHI/self.OMEGA).T - (self.PHI/self.OMEGA) + self.THETA/(self.OMEGA*self.OMEGA.T) 
+                
+                #To be used for training lateral weights Nij 
+                # ∅i/ωi - ∅j/ωj - θij/ωiωj
+                PHASE_DIFF = (self.PHI/self.OMEGA) - (self.PHI/self.OMEGA).T - self.THETA/(self.OMEGA*self.OMEGA.T) 
+                
+                """
+                    Causes of NaN
+                    1. Negative entries in R matrix. Any negative entry in R results in NaN i.e. complex value
+                    Replacing with 'self.R.T' to avoid numerical issues
+                """
+                R_POW_NF = self.R.T #np.power(self.R.T, NORM_FREQ) #self.R.T
+                
+                ARG = self.OMEGA*NORM_PHASE
+                ARG_2 = self.OMEGA*PHASE_DIFF
+                R_COUPLED = self.J*R_POW_NF*np.cos(ARG)
+                PHI_COUPLED = self.J*(R_POW_NF/self.R)*np.sin(ARG)
+                R_COUPLED = np.sum(R_COUPLED, axis=1) 
+                PHI_COUPLED = np.sum(PHI_COUPLED, axis=1)
+                #Converting to coloumn vector
+                R_COUPLED = R_COUPLED[:,None]
+                PHI_COUPLED = PHI_COUPLED[:,None]
+                
+                """
+                When error signal is in complex form.
+                Can eeg signal converted to complex form?
+                """
+                #dR = ( (ONN.MU - self.R**2)*self.R + R_COUPLED + ONN.EPS*ERR[S]*np.cos(self.PHI) )*self.DT 
+                #dPHI = ( self.OMEGA + PHI_COUPLED - ONN.EPS*(ERR[S]/self.R)*np.sin(self.PHI) )*self.DT 
+                """
+                When error signal is in real form.
+                """
+                #dR = ( (ONN.MU - self.R**2)*self.R + R_COUPLED + ONN.EPS*ERR[S])*self.DT 
+                #dPHI = ( self.OMEGA + PHI_COUPLED )*self.DT
+                
+                """
+                TODO: write in complex form.
+                """
+                Z_CMPLX = self.R*np.exp(1j*self.PHI)
+                
+                #Delete me: For debugging
+                self.Z_CMPLX = Z_CMPLX
+                
+                Term1 = Z_CMPLX*(ONN.MU + 1j*self.OMEGA - np.absolute(Z_CMPLX)**2)
+                Term2 = np.sum(self.J*np.exp(1j*( self.THETA/self.OMEGA.T ))*np.power(Z_CMPLX.T, self.OMEGA/self.OMEGA.T), axis=1)[:,None]
+                Term3 = ONN.EPS*ERR[S]
+                
+                dZ_CMPLX = (Term1 + Term2 + Term3)*self.DT
+                Z_CMPLX = Z_CMPLX + dZ_CMPLX
+                
+                #dR = ( (ONN.MU - self.R**2)*self.R + R_COUPLED + ONN.EPS*ERR[S]*np.cos(self.PHI) )*self.DT 
+                #dPHI = ( self.OMEGA + PHI_COUPLED - ONN.EPS*(ERR[S]/self.R)*np.sin(self.PHI) )*self.DT 
+                dOMEGA = -ONN.ETA_OMEGA*ERR[S]*np.sin(self.PHI)*self.DT#*10 #TODO: Remove
+                dALPHA = ONN.ETA_ALPHA*ERR[S]*self.R*np.cos(self.PHI)*self.DT#*10 #TODO: Remove
+                
+                #Equation2
+                COMPLEX_W = self.J*np.exp(1j*self.THETA/self.OMEGA.T)
+                Z1 = self.R*np.exp(1j*self.PHI) #Zi
+                Z2 = self.R.T*np.exp(-1j*self.PHI.T) #Zj*
+                Z2_SP = np.power(Z2, self.OMEGA/self.OMEGA.T)
+                
+                dCOMPLEX_W = (-COMPLEX_W + Z1*Z2_SP)
+                dCOMPLEX_W = np.around(dCOMPLEX_W, decimals=2) #TODO: delete this and add DS wrapper
+                
+                #For debugging: Delete me later
+                self.Z1 = Z1
+                self.Z2_SP = Z2_SP
+                self.dCOMPLEX_W = dCOMPLEX_W 
+                
+                COMPLEX_W = COMPLEX_W + dCOMPLEX_W/ONN.TAU
+                
+                if (np.isnan(R_POW_NF).any()):
+                    print("Overflow most likely...")
+                    print(NORM_FREQ)
+                    print("\n")
+                    print(np.max(NORM_FREQ))
+                    print(1/0)
+
+                #self.R = self.R + dR
+                #self.PHI = self.PHI + dPHI
+                self.R = np.absolute(Z_CMPLX)
+                self.PHI = np.angle(Z_CMPLX)
+                self.OMEGA = self.OMEGA + dOMEGA
+                self.ALPHA = self.ALPHA + dALPHA
+                self.THETA = np.angle(COMPLEX_W)*self.OMEGA.T
+                R_CPL = np.absolute(Term2 + Term3) 
+                PHI_CPL = np.angle(Term2 + Term3)
+                
+                """
+                    Corrections:
+                    1. Non-negative oscillator frequencies
+                    2. Entries in R mtrix should not be negative
+                """
+                #Restrict frequencies of oscillator to positive range only
+                self.OMEGA[self.OMEGA < 0.01] = 0.01 
+                #This avoids NaN restricting R to non-negative values
+                self.R[self.R < 0.01] = 0.01
+                #This avoids NaN due to 'A' term in the denominator in dTHETA
+                np.fill_diagonal(self.THETA, 0)
+                np.fill_diagonal(self.J, 0)
+                #Negative value of amplitudes not allowed
+                self.ALPHA[self.ALPHA < 0.01] = 0.01
+                #Restrict theta (resulting from 1e-300 value of theta 
+                #returned by function np.angle) to avoid underflow error
+                #Might need tro handle the negative case as well
+                #self.THETA[self.THETA < 1e-200] = 1e-20
+                self.THETA = np.around(self.THETA, decimals=2)
+                #Restrict value of R to avoid overflow
+                #self.R[self.R>100] = 100 #Gives weirt frequency convergence
+                
+                self.OMEGA_VERBOSE_[t, S, :] = self.OMEGA.T
+                self.R_VERBOSE_[t, S, :] = self.R.T
+                self.PHI_VERBOSE_[t, S, :] = self.PHI.T
+                self.THETA_VERBOSE_[t, S, :, :] = self.THETA
+                self.dW_VERBOSE_[t, S, :, :] = np.angle(dCOMPLEX_W.T)
+                #Value corresponding to last sample is important
+                #Wrong place for assignment, Change later.
+                self.NORM_PHASE_DIFF_[:,:,t] = NORM_PHASE
+                self.dR_[:,t] = np.absolute(dZ_CMPLX).T
+                self.dPHI_[:,t] = np.angle(dZ_CMPLX).T
+                self.dOMEGA_[:,t] = dOMEGA.T
+                self.dALPHA_[:,t] = dALPHA.T
+                self.dW_[:,:,t] = np.angle(dCOMPLEX_W.T)
+
+            #New Training scheme
+            #Reconstructed = self.generate_samples(self.NSAMPLES, self.DT, self.R, self.PHI, 
+            #                self.OMEGA, self.J, self.THETA, self.ALPHA)
+            #ERR = PTEACH - Reconstructed
+
+            #Consider sum of squares error
+            self.ERR_[t] = np.sum(np.abs(ERR))
+            self.ERR_SIG_[t] = ERR.flatten()
+            self.OMEGA_[:,t+1] = self.OMEGA.T
+            self.SIG_[t] = Reconstructed.flatten()
+            self.ALPHA_[:,t+1] = self.ALPHA.T
+            self.THETA_[:,:,t+1] = self.THETA
+            
+            self.R_CPL_[:,t] = R_CPL.T
+            self.PHI_CPL_[:,t] = PHI_CPL.T
+            
+            ##New Training scheme: Scaling value of alpha to avoid bombing
+            #self.ALPHA = 0.12*self.ALPHA #0.1
+    
